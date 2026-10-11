@@ -1,0 +1,544 @@
+"""
+Major 数据库模块
+- 从 major_data.json 导入 SQLite
+- 提供多种查询功能
+用法：
+  python major_db.py init            # 从 JSON 导入数据库
+  python major_db.py list            # 全部赛事
+  python major_db.py champions       # 冠军排行榜
+  python major_db.py mvp             # MVP 排行榜
+  python major_db.py year 2020 2024  # 年份范围
+  python major_db.py team Astralis   # 某队的所有决赛
+  python major_db.py player ZywOo    # 某选手的 MVP
+  python major_db.py map Mirage      # 某地图的出现记录
+  python major_db.py stats           # 统计概要
+"""
+
+import os
+import re
+import sys
+import json
+import sqlite3
+import unicodedata
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_FILE = os.path.join(SCRIPT_DIR, "major_data.json")
+DB_FILE = os.path.join(SCRIPT_DIR, "majors.db")
+
+
+# ============ 队伍名映射 ============
+TEAM_MAP = {
+    "fnc": "fnatic", "fnatic orig": "fnatic",
+    "nip": "Ninjas in Pyjamas",
+    "ninjas in pyjamas 2012": "Ninjas in Pyjamas",
+    "navi": "Natus Vincere",
+    "vit": "Vitality", "vitality": "Vitality",
+    "vp": "Virtus.pro", "virtus.pro 2012 2": "Virtus.pro",
+    "astralis orig": "Astralis", "astralis": "Astralis",
+    "faze": "FaZe", "faze clan nov 2021": "FaZe", "faze clan": "FaZe",
+    "envy": "EnVyUs", "nv": "EnVyUs", "team envyus orig": "EnVyUs",
+    "ldlc": "LDLC", "team ldlc.com 2012": "LDLC",
+    "lg": "Luminosity", "luminosity gaming orig": "Luminosity",
+    "sk": "SK Gaming", "c9": "Cloud9", "cloud9 orig": "Cloud9",
+    "gambit": "Gambit", "gambit esports1": "Gambit",
+    "imt": "Immortals", "outsiders": "Outsiders",
+    "heroic": "Heroic", "g2": "G2", "ence": "ENCE",
+    "avangar": "AVANGAR", "tl": "Team Liquid", "mibr": "MIBR",
+    "gamerlegion": "GamerLegion", "furia": "FURIA",
+    "mouz": "MOUZ", "spirit": "Spirit", "falcons": "Team Falcons",
+    "mongolz": "The MongolZ",
+}
+
+
+def team_full(abbr):
+    """缩写 → 全名。无映射时返回原值"""
+    if not abbr:
+        return abbr
+    return TEAM_MAP.get(str(abbr).strip().lower(), abbr)
+
+
+# ============ 工具 ============
+def width(s):
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1
+               for c in str(s))
+
+
+def pad(s, w):
+    s = str(s)
+    return s + " " * max(0, w - width(s))
+
+
+def clean(s):
+    """清理 HTML 实体和不可见字符"""
+    s = str(s or "")
+    s = re.sub(r"&#\d+;", "", s)
+    s = s.replace("&nbsp;", " ").replace("\u200b", "")
+    return s.strip()
+
+
+def parse_maps_string(maps_str):
+    """
+    解析 "Mirage 16-9 | Inferno 16-10" 格式
+    返回 [(map_name, score_w, score_l), ...]
+    """
+    if not maps_str or maps_str == "—":
+        return []
+    result = []
+    for part in maps_str.split("|"):
+        m = re.match(r"\s*(\S.*?)\s+(\d+)-(\d+)\s*$", part)
+        if m:
+            result.append((m.group(1), int(m.group(2)), int(m.group(3))))
+    return result
+
+
+# ============ 数据库建表 ============
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS majors (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    page          TEXT UNIQUE NOT NULL,
+    title         TEXT,
+    year          INTEGER,
+    date          TEXT,
+    winner        TEXT,
+    runner_up     TEXT,
+    score         TEXT,
+    mvp_player    TEXT,
+    mvp_team      TEXT,
+    is_cancelled  INTEGER DEFAULT 0,
+    source_path   TEXT
+);
+
+CREATE TABLE IF NOT EXISTS maps (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    major_id      INTEGER NOT NULL,
+    map_order     INTEGER,
+    map_name      TEXT,
+    score_winner  INTEGER,
+    score_loser   INTEGER,
+    FOREIGN KEY (major_id) REFERENCES majors(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_majors_year   ON majors(year);
+CREATE INDEX IF NOT EXISTS idx_majors_winner ON majors(winner);
+CREATE INDEX IF NOT EXISTS idx_majors_mvp    ON majors(mvp_player);
+CREATE INDEX IF NOT EXISTS idx_maps_name     ON maps(map_name);
+"""
+
+
+def get_conn():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def init_tables(conn):
+    conn.executescript(SCHEMA)
+    conn.commit()
+
+
+# ============ 导入 ============
+def sync_from_json():
+    """从 major_data.json 导入/更新数据库"""
+    if not os.path.exists(DATA_FILE):
+        print(f"✗ 未找到 {DATA_FILE}")
+        print("  请先运行 major_crawler.py 生成数据")
+        return
+
+    with open(DATA_FILE, encoding="utf-8") as f:
+        data = json.load(f)
+
+    events = data.get("events", {})
+    if not events:
+        print("✗ JSON 里没有 events 数据")
+        return
+
+    conn = get_conn()
+    init_tables(conn)
+
+    inserted, updated, skipped = 0, 0, 0
+
+    for page, e in events.items():
+        cur = conn.execute(
+            "SELECT id FROM majors WHERE page = ?", (page,))
+        row = cur.fetchone()
+
+        is_cancelled = 1 if e.get("path") == "cancelled" else 0
+        title = clean(e.get("title", page))
+
+        if is_cancelled:
+            year = 2020
+            date = ""
+            winner = "Cancelled"
+            runner_up = "—"
+            score = "—"
+            mvp_player = "—"
+            mvp_team = "—"
+        elif "final" in e:
+            fd = e["final"]
+            date = fd.get("date", "")
+            ym = re.search(r"(\d{4})", date) or \
+                 re.search(r"(\d{4})", title)
+            year = int(ym.group(1)) if ym else 0
+
+            # 队伍名走 team_full 映射
+            winner = team_full(fd["winner"])
+            if fd["winner"] == fd["t1"]:
+                runner_up = team_full(fd["t2"])
+            else:
+                runner_up = team_full(fd["t1"])
+
+            # === 比分转成冠军视角 ===
+            score = fd["score"]
+            if fd["winner"] != fd["t1"]:
+                parts = str(score).split("-")
+                if len(parts) == 2:
+                    score = f"{parts[1]}-{parts[0]}"
+
+            mvp = e.get("mvp") or {}
+            mvp_player = mvp.get("player", "")
+            mvp_team = team_full(mvp.get("team", "")) if mvp.get("team") else ""
+
+        else:
+            skipped += 1
+            continue
+
+        source_path = e.get("path", "")
+
+        if row:
+            conn.execute("""
+                UPDATE majors SET
+                    title=?, year=?, date=?, winner=?, runner_up=?,
+                    score=?, mvp_player=?, mvp_team=?,
+                    is_cancelled=?, source_path=?
+                WHERE page=?
+            """, (title, year, date, winner, runner_up, score,
+                  mvp_player, mvp_team, is_cancelled, source_path, page))
+            major_id = row["id"]
+            updated += 1
+            conn.execute("DELETE FROM maps WHERE major_id=?", (major_id,))
+        else:
+            cur = conn.execute("""
+                INSERT INTO majors
+                    (page, title, year, date, winner, runner_up,
+                     score, mvp_player, mvp_team, is_cancelled, source_path)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (page, title, year, date, winner, runner_up, score,
+                  mvp_player, mvp_team, is_cancelled, source_path))
+            major_id = cur.lastrowid
+            inserted += 1
+
+        # 插入地图
+        maps_str = ""
+        if not is_cancelled:
+            md = e.get("maps_detail") or {}
+            maps_list = md.get("maps") or e.get("final", {}).get("maps") or []
+            maps_str = " | ".join(maps_list)
+        for i, (mname, sw, sl) in enumerate(
+                parse_maps_string(maps_str), 1):
+            conn.execute("""
+                INSERT INTO maps
+                    (major_id, map_order, map_name, score_winner, score_loser)
+                VALUES (?, ?, ?, ?, ?)
+            """, (major_id, i, mname, sw, sl))
+
+    conn.commit()
+    conn.close()
+
+    print(f"✓ 数据库同步完成：{DB_FILE}")
+    print(f"  新增 {inserted} 条，更新 {updated} 条，跳过 {skipped} 条")
+
+
+# ============ 查询 ============
+def q_list(conn):
+    rows = conn.execute("""
+        SELECT year, title, winner, score, runner_up, mvp_player
+        FROM majors WHERE is_cancelled = 0
+        ORDER BY year, date
+    """).fetchall()
+
+    print("\n" + "═" * 100)
+    print(f"  历届 Major 决赛（共 {len(rows)} 届）")
+    print("═" * 100)
+
+    cols = [("年份", 6), ("赛事", 42), ("冠军", 20),
+            ("比分", 6), ("亚军", 20), ("MVP", 14)]
+    total = sum(w for _, w in cols)
+    print("".join(pad(n, w) for n, w in cols))
+    print("─" * total)
+
+    for r in rows:
+        print("".join([
+            pad(r["year"], 6),
+            pad(r["title"][:40], 42),
+            pad(r["winner"][:18], 20),
+            pad(r["score"], 6),
+            pad(r["runner_up"][:18], 20),
+            pad(r["mvp_player"][:12], 14),
+        ]))
+    print("═" * total)
+
+
+def q_champions(conn):
+    rows = conn.execute("""
+        SELECT winner, COUNT(*) as cnt
+        FROM majors WHERE is_cancelled = 0
+        GROUP BY winner
+        ORDER BY cnt DESC, winner
+    """).fetchall()
+
+    print("\n" + "═" * 50)
+    print("  冠军排行榜")
+    print("═" * 50)
+    print(f"{pad('排名', 6)}{pad('战队', 28)}{pad('次数', 8)}")
+    print("─" * 50)
+    for i, r in enumerate(rows, 1):
+        print(f"{pad(i, 6)}{pad(r['winner'], 28)}{pad(r['cnt'], 8)}")
+    print("═" * 50)
+
+
+def q_mvp(conn):
+    rows = conn.execute("""
+        SELECT mvp_player, COUNT(*) as cnt
+        FROM majors
+        WHERE is_cancelled = 0 AND mvp_player != ''
+        GROUP BY mvp_player
+        ORDER BY cnt DESC, mvp_player
+    """).fetchall()
+
+    print("\n" + "═" * 50)
+    print("  MVP 排行榜")
+    print("═" * 50)
+    print(f"{pad('排名', 6)}{pad('选手', 28)}{pad('次数', 8)}")
+    print("─" * 50)
+    for i, r in enumerate(rows, 1):
+        print(f"{pad(i, 6)}{pad(r['mvp_player'], 28)}{pad(r['cnt'], 8)}")
+    print("═" * 50)
+
+
+def q_year(conn, y1, y2):
+    rows = conn.execute("""
+        SELECT year, title, winner, score, runner_up, mvp_player
+        FROM majors
+        WHERE is_cancelled = 0 AND year BETWEEN ? AND ?
+        ORDER BY year
+    """, (y1, y2)).fetchall()
+
+    print(f"\n  {y1}–{y2} 年的 Major（{len(rows)} 届）")
+    print("─" * 100)
+    cols = [("年份", 6), ("赛事", 42), ("冠军", 20),
+            ("比分", 6), ("亚军", 20), ("MVP", 14)]
+    print("".join(pad(n, w) for n, w in cols))
+    print("─" * 100)
+    for r in rows:
+        print("".join([
+            pad(r["year"], 6),
+            pad(r["title"][:40], 42),
+            pad(r["winner"][:18], 20),
+            pad(r["score"], 6),
+            pad(r["runner_up"][:18], 20),
+            pad(r["mvp_player"][:12], 14),
+        ]))
+
+
+def q_team(conn, team):
+    rows = conn.execute("""
+        SELECT year, title, winner, score, runner_up, mvp_player,
+               CASE
+                   WHEN winner LIKE ? THEN '冠军'
+                   ELSE '亚军'
+               END as role
+        FROM majors
+        WHERE is_cancelled = 0
+          AND (winner LIKE ? OR runner_up LIKE ?)
+        ORDER BY year
+    """, (f"%{team}%", f"%{team}%", f"%{team}%")).fetchall()
+
+    if not rows:
+        print(f"\n  未找到包含「{team}」的记录")
+        return
+
+    print(f"\n  「{team}」的 Major 决赛记录（{len(rows)} 场）")
+    print("─" * 100)
+    cols = [("年份", 6), ("赛事", 42), ("角色", 8),
+            ("比分", 6), ("对手", 22), ("MVP", 14)]
+    print("".join(pad(n, w) for n, w in cols))
+    print("─" * 100)
+    for r in rows:
+        opponent = r["runner_up"] if r["role"] == "冠军" else r["winner"]
+        print("".join([
+            pad(r["year"], 6),
+            pad(r["title"][:40], 42),
+            pad(r["role"], 8),
+            pad(r["score"], 6),
+            pad(opponent[:20], 22),
+            pad(r["mvp_player"][:12], 14),
+        ]))
+
+
+def q_player(conn, player):
+    rows = conn.execute("""
+        SELECT year, title, mvp_team
+        FROM majors
+        WHERE is_cancelled = 0 AND mvp_player LIKE ?
+        ORDER BY year
+    """, (f"%{player}%",)).fetchall()
+
+    if not rows:
+        print(f"\n  未找到「{player}」的 MVP 记录")
+        return
+
+    print(f"\n  「{player}」的 MVP 记录（{len(rows)} 次）")
+    print("─" * 100)
+    for r in rows:
+        print(f"  {r['year']}  {r['title']}  ({r['mvp_team']})")
+
+
+def q_map(conn, map_name):
+    rows = conn.execute("""
+        SELECT m.year, m.title, mp.map_order,
+               mp.score_winner, mp.score_loser,
+               m.winner, m.runner_up
+        FROM maps mp
+        JOIN majors m ON mp.major_id = m.id
+        WHERE mp.map_name LIKE ?
+        ORDER BY m.year
+    """, (f"%{map_name}%",)).fetchall()
+
+    if not rows:
+        print(f"\n  未找到「{map_name}」的记录")
+        return
+
+    print(f"\n  「{map_name}」出现的决赛地图（{len(rows)} 次）")
+    print("─" * 100)
+    cols = [("年份", 6), ("赛事", 40), ("地图", 12),
+            ("冠军方", 8), ("亚军方", 8), ("结果", 22)]
+    print("".join(pad(n, w) for n, w in cols))
+    print("─" * 100)
+    for r in rows:
+        result = f"{r['winner']} {r['score_winner']}-{r['score_loser']}"
+        print("".join([
+            pad(r["year"], 6),
+            pad(r["title"][:38], 40),
+            pad(map_name[:10], 12),
+            pad(r["score_winner"], 8),
+            pad(r["score_loser"], 8),
+            pad(result[:20], 22),
+        ]))
+
+
+def q_stats(conn):
+    total = conn.execute(
+        "SELECT COUNT(*) FROM majors WHERE is_cancelled = 0"
+    ).fetchone()[0]
+    cancelled = conn.execute(
+        "SELECT COUNT(*) FROM majors WHERE is_cancelled = 1"
+    ).fetchone()[0]
+    teams = conn.execute(
+        "SELECT COUNT(DISTINCT winner) FROM majors WHERE is_cancelled = 0"
+    ).fetchone()[0]
+    mvps = conn.execute(
+        "SELECT COUNT(DISTINCT mvp_player) FROM majors "
+        "WHERE is_cancelled = 0 AND mvp_player != ''"
+    ).fetchone()[0]
+    maps = conn.execute("SELECT COUNT(*) FROM maps").fetchone()[0]
+    year_range = conn.execute(
+        "SELECT MIN(year), MAX(year) FROM majors WHERE is_cancelled = 0"
+    ).fetchone()
+
+    top_winner = conn.execute("""
+        SELECT winner, COUNT(*) as cnt FROM majors
+        WHERE is_cancelled = 0
+        GROUP BY winner ORDER BY cnt DESC LIMIT 1
+    """).fetchone()
+
+    top_mvp = conn.execute("""
+        SELECT mvp_player, COUNT(*) as cnt FROM majors
+        WHERE is_cancelled = 0 AND mvp_player != ''
+        GROUP BY mvp_player ORDER BY cnt DESC LIMIT 1
+    """).fetchone()
+
+    top_map = conn.execute("""
+        SELECT map_name, COUNT(*) as cnt FROM maps
+        GROUP BY map_name ORDER BY cnt DESC LIMIT 1
+    """).fetchone()
+
+    print("\n" + "═" * 50)
+    print("  数据统计概要")
+    print("═" * 50)
+    print(f"  Major 总数:      {total} 届")
+    print(f"  已取消:          {cancelled} 届 (2020 Rio)")
+    print(f"  年份跨度:        {year_range[0]} – {year_range[1]}")
+    print(f"  夺冠战队数:      {teams} 支")
+    print(f"  MVP 选手数:      {mvps} 人")
+    print(f"  决赛地图总数:    {maps} 张")
+    print("─" * 50)
+    if top_winner:
+        print(f"  夺冠最多:        {top_winner['winner']} ({top_winner['cnt']} 次)")
+    if top_mvp:
+        print(f"  MVP 最多:        {top_mvp['mvp_player']} ({top_mvp['cnt']} 次)")
+    if top_map:
+        print(f"  最常出现地图:    {top_map['map_name']} ({top_map['cnt']} 次)")
+    print("═" * 50)
+
+
+# ============ 入口 ============
+def main():
+    args = sys.argv[1:]
+
+    if not args:
+        print(__doc__)
+        return
+
+    cmd = args[0]
+
+    if cmd == "init":
+        sync_from_json()
+        return
+
+    if not os.path.exists(DB_FILE):
+        print(f"✗ 数据库不存在：{DB_FILE}")
+        print("  请先运行：python major_db.py init")
+        return
+
+    conn = get_conn()
+    init_tables(conn)
+
+    try:
+        if cmd == "list":
+            q_list(conn)
+        elif cmd == "champions":
+            q_champions(conn)
+        elif cmd == "mvp":
+            q_mvp(conn)
+        elif cmd == "year":
+            if len(args) < 3:
+                print("用法：python major_db.py year 2020 2024")
+                return
+            q_year(conn, int(args[1]), int(args[2]))
+        elif cmd == "team":
+            if len(args) < 2:
+                print("用法：python major_db.py team Astralis")
+                return
+            q_team(conn, args[1])
+        elif cmd == "player":
+            if len(args) < 2:
+                print("用法：python major_db.py player ZywOo")
+                return
+            q_player(conn, args[1])
+        elif cmd == "map":
+            if len(args) < 2:
+                print("用法：python major_db.py map Mirage")
+                return
+            q_map(conn, args[1])
+        elif cmd == "stats":
+            q_stats(conn)
+        else:
+            print(f"未知命令：{cmd}")
+            print(__doc__)
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    main()

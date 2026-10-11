@@ -1,0 +1,7 @@
+ggpyscraper
+pandas
+regex
+aiohttp
+pytz
+beautifulsoup4
+lxml
