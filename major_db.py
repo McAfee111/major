@@ -31,12 +31,13 @@ TEAM_MAP = {
     "fnc": "fnatic", "fnatic orig": "fnatic",
     "nip": "Ninjas in Pyjamas",
     "ninjas in pyjamas 2012": "Ninjas in Pyjamas",
-    "navi": "Natus Vincere",
+    "navi": "Natus Vincere","na'vi": "Natus Vincere",
     "vit": "Vitality", "vitality": "Vitality",
     "vp": "Virtus.pro", "virtus.pro 2012 2": "Virtus.pro",
     "astralis orig": "Astralis", "astralis": "Astralis",
     "faze": "FaZe", "faze clan nov 2021": "FaZe", "faze clan": "FaZe",
-    "envy": "EnVyUs", "nv": "EnVyUs", "team envyus orig": "EnVyUs",
+    "envy": "EnVyUs",# 具有歧义的缩写用列表表示
+    "nv": ["Natus Vincere", "EnVyUs"], "team envyus orig": "EnVyUs",
     "ldlc": "LDLC", "team ldlc.com 2012": "LDLC",
     "lg": "Luminosity", "luminosity gaming orig": "Luminosity",
     "sk": "SK Gaming", "c9": "Cloud9", "cloud9 orig": "Cloud9",
@@ -45,8 +46,38 @@ TEAM_MAP = {
     "heroic": "Heroic", "g2": "G2", "ence": "ENCE",
     "avangar": "AVANGAR", "tl": "Team Liquid", "mibr": "MIBR",
     "gamerlegion": "GamerLegion", "furia": "FURIA",
-    "mouz": "MOUZ", "spirit": "Spirit", "falcons": "Team Falcons",
+    "mouz": "MOUZ", "spirit": "Spirit", "falcons": "Team Falcons","flc": "Team Falcons",
     "mongolz": "The MongolZ",
+}
+
+
+# ============ 选手别名字典 ============
+# 只有涉及数字替换字母（0->o, 1->i/l）的选手，才需要放进这里
+# 纯字母选手靠大小写清洗就能完美匹配，无需写在这里
+PLAYER_ALIASES = {
+    "monesy": "m0nesy",    # 0 -> o
+    "simple": "s1mple",    # 1 -> i
+    "device": "dev1ce",    # 1 -> i
+}
+
+
+# ============ 地图别名字典 ============
+# 数据库里通常存的是完整拼写（如 Dust II），这里把常见缩写和特殊写法统一映射
+# 注意：清洗时我们会删掉空格，所以 "dust ii" 会变成 "dustii"
+MAP_ALIASES = {
+    "d2": "dust2",
+    "dust": "dust2",
+    "dustii": "dust2",        # 兼容用户输入 Dust II
+    "cbble": "cobblestone",
+    "cbl": "cobblestone",
+    "cobble": "cobblestone",
+    "op": "overpass",
+    "inf": "inferno",
+    "mrg": "mirage",
+    "anc": "ancient",
+    "anb": "anubis",
+    "vrt": "vertigo",
+    "cch": "cache",
 }
 
 
@@ -341,86 +372,188 @@ def q_year(conn, y1, y2):
         ]))
 
 
-def q_team(conn, team):
+def _query_and_print_team(conn, clean_name, display_name):
+    """内部辅助函数：查询单支战队并打印结果"""
     rows = conn.execute("""
         SELECT year, title, winner, score, runner_up, mvp_player,
                CASE
-                   WHEN winner LIKE ? THEN '冠军'
+                   WHEN LOWER(REPLACE(REPLACE(winner, ' ', ''), 'team', '')) LIKE ? THEN '冠军'
                    ELSE '亚军'
                END as role
         FROM majors
         WHERE is_cancelled = 0
-          AND (winner LIKE ? OR runner_up LIKE ?)
+          AND (
+              LOWER(REPLACE(REPLACE(winner, ' ', ''), 'team', '')) LIKE ? 
+              OR 
+              LOWER(REPLACE(REPLACE(runner_up, ' ', ''), 'team', '')) LIKE ?
+          )
         ORDER BY year
-    """, (f"%{team}%", f"%{team}%", f"%{team}%")).fetchall()
+    """, (f"%{clean_name}%", f"%{clean_name}%", f"%{clean_name}%")).fetchall()
 
     if not rows:
-        print(f"\n  未找到包含「{team}」的记录")
+        print(f"\n  未找到包含「{display_name}」的记录")
         return
 
-    print(f"\n  「{team}」的 Major 决赛记录（{len(rows)} 场）")
+    # 提取真实队名用于显示标题
+    real_team_name = display_name
+    for r in rows:
+        if r["role"] == "冠军":
+            real_team_name = r["winner"]
+            break
+    else:
+        if rows:
+            real_team_name = rows[0]["runner_up"]
+
+    print(f"\n  「{real_team_name}」的 Major 决赛记录（{len(rows)} 场）")
     print("─" * 100)
     cols = [("年份", 6), ("赛事", 42), ("角色", 8),
             ("比分", 6), ("对手", 22), ("MVP", 14)]
     print("".join(pad(n, w) for n, w in cols))
     print("─" * 100)
+    
     for r in rows:
         opponent = r["runner_up"] if r["role"] == "冠军" else r["winner"]
+        
+        # 修复比分视角（亚军反转比分）
+        display_score = r["score"]
+        if r["role"] == "亚军" and "-" in display_score:
+            parts = display_score.split("-")
+            if len(parts) == 2:
+                display_score = f"{parts[1]}-{parts[0]}"
+
         print("".join([
             pad(r["year"], 6),
             pad(r["title"][:40], 42),
             pad(r["role"], 8),
-            pad(r["score"], 6),
+            pad(display_score, 6),
             pad(opponent[:20], 22),
             pad(r["mvp_player"][:12], 14),
         ]))
 
 
+def q_team(conn, team):
+    # 1. 输入预处理：转小写，去两端空格
+    raw_query = str(team).strip().lower()
+    
+    # 2. 首次映射：尝试直接查字典
+    query_mapped = TEAM_MAP.get(raw_query, raw_query)
+    
+    # 3. 抹平差异：如果是字符串，去掉空格和 "team" 进行二次防呆映射
+    if isinstance(query_mapped, str):
+        query_clean = query_mapped.replace(" ", "").replace("team", "")
+        
+        # 二次映射（防 Teamtl 这种情况）
+        if query_clean in TEAM_MAP:
+            query_mapped = TEAM_MAP[query_clean]
+            if isinstance(query_mapped, str):
+                query_clean = query_mapped.replace(" ", "").replace("team", "")
+
+    # 4. 核心判断：如果是列表，说明遇到了歧义缩写（如 nv）
+    if isinstance(query_mapped, list):
+        print(f"\n  💡 提示：在 CS 社区中，「{team}」可能指代 {' 或 '.join(query_mapped)}，为您分别展示：")
+        for target_team in query_mapped:
+            # 对列表里的每个真实队名做清洗，然后调用辅助函数去查
+            clean_target = target_team.replace(" ", "").replace("team", "").lower()
+            _query_and_print_team(conn, clean_target, target_team)
+        return
+
+    # 5. 防呆保护（如果输入了纯空格或者纯 team）
+    if not query_clean:
+        print(f"\n  无效的战队名「{team}」，请输入具体的战队名称（如 Astralis）。")
+        return
+
+    # 6. 极短词拦截（防止 LIKE '%nc%' 误匹配到 Vincere 和 ENCE）
+    # 如果清洗后长度小于 3，且原词和清洗词都不在字典里，直接拦截
+    if len(query_clean) < 3 and query_clean not in TEAM_MAP and raw_query not in TEAM_MAP:
+        print(f"\n  ⚠ 搜索词「{team}」过短，容易匹配到多个不相关战队。")
+        print(f"  请输入更完整的战队名称。")
+        return
+
+    # 7. 正常情况：不是歧义缩写，直接调用辅助函数
+    _query_and_print_team(conn, query_clean, team)
+
+
 def q_player(conn, player):
+    # 1. 输入清洗：转小写，去除前后空格
+    query = str(player).strip().lower()
+    
+    # 2. 别名映射：解决 m0NESY / s1mple 等特殊拼写问题
+    query_mapped = PLAYER_ALIASES.get(query, query)
+
+    # === 防呆保护：如果清洗后变成空字符串，直接拦截 ===
+    if not query_mapped:
+        print(f"\n  无效的选手名「{player}」，请输入具体的选手名称（如 ZywOo）。")
+        return
+    # ===================================================
+
+    # 3. SQL 查询：通过 LOWER() 抹平大小写差异
     rows = conn.execute("""
-        SELECT year, title, mvp_team
+        SELECT year, title, mvp_team, mvp_player
         FROM majors
-        WHERE is_cancelled = 0 AND mvp_player LIKE ?
+        WHERE is_cancelled = 0 AND LOWER(mvp_player) LIKE ?
         ORDER BY year
-    """, (f"%{player}%",)).fetchall()
+    """, (f"%{query_mapped}%",)).fetchall()
 
     if not rows:
         print(f"\n  未找到「{player}」的 MVP 记录")
         return
 
-    print(f"\n  「{player}」的 MVP 记录（{len(rows)} 次）")
+    # 4. 从数据库中提取真实的拼写用于显示
+    real_name = rows[0]["mvp_player"]
+
+    # 5. 简洁输出：标题用数据库里的原版拼写，不用用户输入的
+    print(f"\n  「{real_name}」的 MVP 记录（{len(rows)} 次）")
     print("─" * 100)
     for r in rows:
         print(f"  {r['year']}  {r['title']}  ({r['mvp_team']})")
 
 
 def q_map(conn, map_name):
+    # 1. 输入清洗：转小写、去掉 "de_" 前缀、去掉所有空格
+    query = str(map_name).strip().lower().replace("de_", "").replace(" ", "")
+    
+    # 2. 查地图别名（把 d2 替换成 dust2，把 op 替换成 overpass）
+    query_clean = MAP_ALIASES.get(query, query)
+
+    # 3. 防呆保护
+    if not query_clean:
+        print(f"\n  无效的地图名「{map_name}」，请输入具体的地图名称（如 Mirage）。")
+        return
+
+    if len(query_clean) < 2:
+        print(f"\n  ⚠ 搜索词「{map_name}」过短，请输入更完整的地图名称。")
+        return
+
+    # 4. SQL 查询：先转小写(LOWER)，再去空格，再去 de_ 前缀，最后把 dustii 统一成 dust2
     rows = conn.execute("""
         SELECT m.year, m.title, mp.map_order,
                mp.score_winner, mp.score_loser,
-               m.winner, m.runner_up
+               m.winner, m.runner_up, mp.map_name
         FROM maps mp
         JOIN majors m ON mp.major_id = m.id
-        WHERE mp.map_name LIKE ?
+        WHERE REPLACE(REPLACE(REPLACE(LOWER(mp.map_name), ' ', ''), 'de_', ''), 'dustii', 'dust2') LIKE ?
         ORDER BY m.year
-    """, (f"%{map_name}%",)).fetchall()
+    """, (f"%{query_clean}%",)).fetchall()
 
     if not rows:
-        print(f"\n  未找到「{map_name}」的记录")
+        print(f"\n  未找到包含「{map_name}」的记录")
         return
 
-    print(f"\n  「{map_name}」出现的决赛地图（{len(rows)} 次）")
+    real_map_name = rows[0]["map_name"]
+
+    print(f"\n  「{real_map_name}」出现的决赛地图（{len(rows)} 次）")
     print("─" * 100)
     cols = [("年份", 6), ("赛事", 40), ("地图", 12),
             ("冠军方", 8), ("亚军方", 8), ("结果", 22)]
     print("".join(pad(n, w) for n, w in cols))
     print("─" * 100)
+    
     for r in rows:
         result = f"{r['winner']} {r['score_winner']}-{r['score_loser']}"
         print("".join([
             pad(r["year"], 6),
             pad(r["title"][:38], 40),
-            pad(map_name[:10], 12),
+            pad(r["map_name"][:10], 12),
             pad(r["score_winner"], 8),
             pad(r["score_loser"], 8),
             pad(result[:20], 22),
@@ -516,21 +649,26 @@ def main():
                 print("用法：python major_db.py year 2020 2024")
                 return
             q_year(conn, int(args[1]), int(args[2]))
+            
         elif cmd == "team":
             if len(args) < 2:
                 print("用法：python major_db.py team Astralis")
                 return
-            q_team(conn, args[1])
+            # 修复：把后面的词拼起来，比如 ["TEAM", "aStRalis"] -> "TEAM aStRalis"
+            q_team(conn, " ".join(args[1:]))
+            
         elif cmd == "player":
             if len(args) < 2:
                 print("用法：python major_db.py player ZywOo")
                 return
-            q_player(conn, args[1])
+            q_player(conn, " ".join(args[1:]))
+            
         elif cmd == "map":
             if len(args) < 2:
                 print("用法：python major_db.py map Mirage")
                 return
-            q_map(conn, args[1])
+            q_map(conn, " ".join(args[1:]))
+            
         elif cmd == "stats":
             q_stats(conn)
         else:
