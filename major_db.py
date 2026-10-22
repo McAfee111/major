@@ -8,9 +8,9 @@ Major 数据库模块
   python major_db.py champions       # 冠军排行榜
   python major_db.py mvp             # MVP 排行榜
   python major_db.py year 2020 2024  # 年份范围
-  python major_db.py team Astralis   # 某队的所有决赛
-  python major_db.py player ZywOo    # 某选手的 MVP
-  python major_db.py map Mirage      # 某地图的出现记录
+  python major_db.py team Astralis   # 某队的所有决赛（支持歧义拆分与自动纠错）
+  python major_db.py player ZywOo    # 某选手的 MVP（支持字母数字映射）
+  python major_db.py map Mirage      # 某地图的出现记录（支持 de_ 前缀过滤）
   python major_db.py stats           # 统计概要
 """
 
@@ -25,30 +25,17 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.path.join(SCRIPT_DIR, "major_data.json")
 DB_FILE = os.path.join(SCRIPT_DIR, "majors.db")
 
-
-# ============ 队伍名映射 ============
-TEAM_MAP = {
-    "fnc": "fnatic", "fnatic orig": "fnatic",
-    "nip": "Ninjas in Pyjamas",
-    "ninjas in pyjamas 2012": "Ninjas in Pyjamas",
-    "navi": "Natus Vincere","na'vi": "Natus Vincere",
-    "vit": "Vitality", "vitality": "Vitality",
-    "vp": "Virtus.pro", "virtus.pro 2012 2": "Virtus.pro",
-    "astralis orig": "Astralis", "astralis": "Astralis",
-    "faze": "FaZe", "faze clan nov 2021": "FaZe", "faze clan": "FaZe",
-    "envy": "EnVyUs",# 具有歧义的缩写用列表表示
-    "nv": ["Natus Vincere", "EnVyUs"], "team envyus orig": "EnVyUs",
-    "ldlc": "LDLC", "team ldlc.com 2012": "LDLC",
-    "lg": "Luminosity", "luminosity gaming orig": "Luminosity",
-    "sk": "SK Gaming", "c9": "Cloud9", "cloud9 orig": "Cloud9",
-    "gambit": "Gambit", "gambit esports1": "Gambit",
-    "imt": "Immortals", "outsiders": "Outsiders",
-    "heroic": "Heroic", "g2": "G2", "ence": "ENCE",
-    "avangar": "AVANGAR", "tl": "Team Liquid", "mibr": "MIBR",
-    "gamerlegion": "GamerLegion", "furia": "FURIA",
-    "mouz": "MOUZ", "spirit": "Spirit", "falcons": "Team Falcons","flc": "Team Falcons",
-    "mongolz": "The MongolZ",
-}
+# === 读取队伍映射字典 ===
+TEAM_MAP_FILE = os.path.join(SCRIPT_DIR, "teams.json")
+try:
+    with open(TEAM_MAP_FILE, encoding="utf-8") as f:
+        TEAM_MAP = json.load(f)
+except FileNotFoundError:
+    print(f"✗ 未找到 {TEAM_MAP_FILE}，请确保它与数据库脚本在同一目录。")
+    sys.exit(1)
+except json.JSONDecodeError as e:
+    print(f"✗ 解析 {TEAM_MAP_FILE} 失败，请检查 JSON 格式。错误信息：{e}")
+    sys.exit(1)
 
 
 # ============ 选手别名字典 ============
@@ -348,19 +335,36 @@ def q_mvp(conn):
 
 
 def q_year(conn, y1, y2):
+    # === 防呆保护：校验输入是否为有效数字 ===
+    try:
+        y1_int = int(y1)
+        y2_int = int(y2)
+    except ValueError:
+        print(f"\n  ⚠ 无效的年份格式「{y1}」或「{y2}」，请输入纯数字（如 2020 2024）。")
+        return
+
+    # 保证范围是从小到大，防止用户输入 year 2024 2020 查不出来
+    if y1_int > y2_int:
+        y1_int, y2_int = y2_int, y1_int
+
     rows = conn.execute("""
         SELECT year, title, winner, score, runner_up, mvp_player
         FROM majors
         WHERE is_cancelled = 0 AND year BETWEEN ? AND ?
         ORDER BY year
-    """, (y1, y2)).fetchall()
+    """, (y1_int, y2_int)).fetchall()
 
-    print(f"\n  {y1}–{y2} 年的 Major（{len(rows)} 届）")
+    if not rows:
+        print(f"\n  {y1_int}–{y2_int} 年之间没有任何 Major 记录。")
+        return
+
+    print(f"\n  {y1_int}–{y2_int} 年的 Major（{len(rows)} 届）")
     print("─" * 100)
     cols = [("年份", 6), ("赛事", 42), ("冠军", 20),
             ("比分", 6), ("亚军", 20), ("MVP", 14)]
     print("".join(pad(n, w) for n, w in cols))
     print("─" * 100)
+    
     for r in rows:
         print("".join([
             pad(r["year"], 6),
@@ -373,19 +377,21 @@ def q_year(conn, y1, y2):
 
 
 def _query_and_print_team(conn, clean_name, display_name):
-    """内部辅助函数：查询单支战队并打印结果"""
+    # === 把传入的 clean_name 也做一次清洗 ===
+    clean_name = re.sub(r'[^a-z0-9]', '', clean_name.lower())
+    
     rows = conn.execute("""
         SELECT year, title, winner, score, runner_up, mvp_player,
                CASE
-                   WHEN LOWER(REPLACE(REPLACE(winner, ' ', ''), 'team', '')) LIKE ? THEN '冠军'
+                   WHEN REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(LOWER(winner), ' ', ''), 'team', ''), '.', ''), '_', ''), '-', '') LIKE ? THEN '冠军'
                    ELSE '亚军'
                END as role
         FROM majors
         WHERE is_cancelled = 0
           AND (
-              LOWER(REPLACE(REPLACE(winner, ' ', ''), 'team', '')) LIKE ? 
+              REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(LOWER(winner), ' ', ''), 'team', ''), '.', ''), '_', ''), '-', '') LIKE ? 
               OR 
-              LOWER(REPLACE(REPLACE(runner_up, ' ', ''), 'team', '')) LIKE ?
+              REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(LOWER(runner_up), ' ', ''), 'team', ''), '.', ''), '_', ''), '-', '') LIKE ?
           )
         ORDER BY year
     """, (f"%{clean_name}%", f"%{clean_name}%", f"%{clean_name}%")).fetchall()
@@ -394,7 +400,6 @@ def _query_and_print_team(conn, clean_name, display_name):
         print(f"\n  未找到包含「{display_name}」的记录")
         return
 
-    # 提取真实队名用于显示标题
     real_team_name = display_name
     for r in rows:
         if r["role"] == "冠军":
@@ -406,15 +411,12 @@ def _query_and_print_team(conn, clean_name, display_name):
 
     print(f"\n  「{real_team_name}」的 Major 决赛记录（{len(rows)} 场）")
     print("─" * 100)
-    cols = [("年份", 6), ("赛事", 42), ("角色", 8),
-            ("比分", 6), ("对手", 22), ("MVP", 14)]
+    cols = [("年份", 6), ("赛事", 42), ("角色", 8), ("比分", 6), ("对手", 22), ("MVP", 14)]
     print("".join(pad(n, w) for n, w in cols))
     print("─" * 100)
     
     for r in rows:
         opponent = r["runner_up"] if r["role"] == "冠军" else r["winner"]
-        
-        # 修复比分视角（亚军反转比分）
         display_score = r["score"]
         if r["role"] == "亚军" and "-" in display_score:
             parts = display_score.split("-")
@@ -422,54 +424,53 @@ def _query_and_print_team(conn, clean_name, display_name):
                 display_score = f"{parts[1]}-{parts[0]}"
 
         print("".join([
-            pad(r["year"], 6),
-            pad(r["title"][:40], 42),
-            pad(r["role"], 8),
-            pad(display_score, 6),
-            pad(opponent[:20], 22),
-            pad(r["mvp_player"][:12], 14),
+            pad(r["year"], 6), pad(r["title"][:40], 42), pad(r["role"], 8),
+            pad(display_score, 6), pad(opponent[:20], 22), pad(r["mvp_player"][:12], 14),
         ]))
 
 
 def q_team(conn, team):
-    # 1. 输入预处理：转小写，去两端空格
-    raw_query = str(team).strip().lower()
+    # 1. 终极脱敏：转小写，剔除所有非字母数字（单引号、下划线、空格全没）
+    raw_query = re.sub(r'[^a-z0-9]', '', str(team).lower())
     
     # 2. 首次映射：尝试直接查字典
     query_mapped = TEAM_MAP.get(raw_query, raw_query)
     
-    # 3. 抹平差异：如果是字符串，去掉空格和 "team" 进行二次防呆映射
+    # 3. 二次清洗（剥离 team 前缀）
     if isinstance(query_mapped, str):
-        query_clean = query_mapped.replace(" ", "").replace("team", "")
+        query_clean = re.sub(r'[^a-z0-9]', '', query_mapped.lower())
         
-        # 二次映射（防 Teamtl 这种情况）
+        # 安全剥离前缀（比 replace 安全）
+        if query_clean.startswith("team"):
+            query_clean = query_clean[4:]
+            
+        # 如果剥离后在字典里，再映射一次
         if query_clean in TEAM_MAP:
             query_mapped = TEAM_MAP[query_clean]
             if isinstance(query_mapped, str):
-                query_clean = query_mapped.replace(" ", "").replace("team", "")
-
+                query_clean = re.sub(r'[^a-z0-9]', '', query_mapped.lower())
+                if query_clean.startswith("team"):
+                    query_clean = query_clean[4:]
+                    
     # 4. 核心判断：如果是列表，说明遇到了歧义缩写（如 nv）
     if isinstance(query_mapped, list):
         print(f"\n  💡 提示：在 CS 社区中，「{team}」可能指代 {' 或 '.join(query_mapped)}，为您分别展示：")
         for target_team in query_mapped:
-            # 对列表里的每个真实队名做清洗，然后调用辅助函数去查
-            clean_target = target_team.replace(" ", "").replace("team", "").lower()
-            _query_and_print_team(conn, clean_target, target_team)
+            _query_and_print_team(conn, target_team, target_team)
         return
 
-    # 5. 防呆保护（如果输入了纯空格或者纯 team）
+    # 5. 防呆保护
     if not query_clean:
         print(f"\n  无效的战队名「{team}」，请输入具体的战队名称（如 Astralis）。")
         return
 
-    # 6. 极短词拦截（防止 LIKE '%nc%' 误匹配到 Vincere 和 ENCE）
-    # 如果清洗后长度小于 3，且原词和清洗词都不在字典里，直接拦截
+    # 6. 极短词拦截
     if len(query_clean) < 3 and query_clean not in TEAM_MAP and raw_query not in TEAM_MAP:
         print(f"\n  ⚠ 搜索词「{team}」过短，容易匹配到多个不相关战队。")
-        print(f"  请输入更完整的战队名称。")
+        print(f"  请输入更完整的战队名称（如 NaVi 或 ENCE）。")
         return
 
-    # 7. 正常情况：不是歧义缩写，直接调用辅助函数
+    # 7. 正常调用
     _query_and_print_team(conn, query_clean, team)
 
 
@@ -625,36 +626,43 @@ def main():
 
     cmd = args[0]
 
+    # 初始化数据库单独处理（内部会自己建表并导入）
     if cmd == "init":
         sync_from_json()
         return
 
+    # 检查数据库是否存在
     if not os.path.exists(DB_FILE):
         print(f"✗ 数据库不存在：{DB_FILE}")
         print("  请先运行：python major_db.py init")
         return
 
+    # 建立数据库连接
     conn = get_conn()
     init_tables(conn)
 
     try:
         if cmd == "list":
             q_list(conn)
+            
         elif cmd == "champions":
             q_champions(conn)
+            
         elif cmd == "mvp":
             q_mvp(conn)
+            
         elif cmd == "year":
             if len(args) < 3:
                 print("用法：python major_db.py year 2020 2024")
                 return
-            q_year(conn, int(args[1]), int(args[2]))
+            # 修复：直接把字符串传进去，q_year 内部会处理防呆和数字转换
+            q_year(conn, args[1], args[2])
             
         elif cmd == "team":
             if len(args) < 2:
                 print("用法：python major_db.py team Astralis")
                 return
-            # 修复：把后面的词拼起来，比如 ["TEAM", "aStRalis"] -> "TEAM aStRalis"
+            # 把后面的词拼起来，比如 ["TEAM", "aStRalis"] -> "TEAM aStRalis"
             q_team(conn, " ".join(args[1:]))
             
         elif cmd == "player":
@@ -671,10 +679,13 @@ def main():
             
         elif cmd == "stats":
             q_stats(conn)
+            
         else:
             print(f"未知命令：{cmd}")
             print(__doc__)
+            
     finally:
+        # 无论执行成功还是报错，最后都稳妥地关闭数据库连接
         conn.close()
 
 

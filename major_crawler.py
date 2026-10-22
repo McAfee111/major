@@ -8,13 +8,13 @@ CS:GO / CS2 Major 决赛数据爬虫
   python major_crawler.py --check     # 只做完整性检查，不抓取
 
 首次使用：
-  1. 安装依赖：pip install ggpyscraper regex aiohttp pytz beautifulsoup4 lxml pandas
-  2. 设置环境变量 LIQUIPEDIA_USER_AGENT，或在下方 USER_AGENT 里
-     把邮箱换成你自己的（Liquipedia 要求真实联系方式）：
-       格式示例：CSMajorScraper/1.0 (personal research; you@example.com)
+  1. 安装依赖：pip install -r requirements.txt
+  2. 必须设置环境变量 LIQUIPEDIA_USER_AGENT（Liquipedia 要求真实联系方式）：
+     Windows (PowerShell): $env:LIQUIPEDIA_USER_AGENT="CSMajorScraper/1.0 (you@example.com)"
+     Linux / macOS: export LIQUIPEDIA_USER_AGENT="CSMajorScraper/1.0 (you@example.com)"
 
 注意：Liquipedia 要求每次 API 请求间隔至少 30 秒。
-      本项目默认使用 60 秒（REQUEST_DELAY = 60），更保险。
+      本项目默认使用 60 秒（REQUEST_DELAY = 60），且底层封装了绝对节流阀。
 """
 
 import os
@@ -46,16 +46,37 @@ if _missing:
 
 
 # ============ 配置 ============
-# ⚠ 优先读环境变量 LIQUIPEDIA_USER_AGENT；
-#   未设置时使用下面的兜底值（请把邮箱改成你自己的）。
-#   Liquipedia API 要求提供真实联系方式。
-USER_AGENT = os.getenv(
-    "LIQUIPEDIA_USER_AGENT",
-    "CSMajorScraper/1.0 (personal research; your-email@example.com)"
-)
+# ⚠ 强制要求读取环境变量，无兜底值
+USER_AGENT = os.getenv("LIQUIPEDIA_USER_AGENT")
+
+if not USER_AGENT:
+    print("=" * 70)
+    print("  ✗ 致命错误：未设置环境变量 LIQUIPEDIA_USER_AGENT")
+    print("=" * 70)
+    print("\nLiquipedia API 要求必须提供真实的联系方式（邮箱）。")
+    print("请在终端中设置：")
+    print("  $env:LIQUIPEDIA_USER_AGENT=\"CSMajorScraper/1.0 (you@example.com)\"")
+    print("\n或者直接在代码里修改 USER_AGENT 的默认值。")
+    sys.exit(1)  # 强制退出程序
 
 # Liquipedia 官方要求 ≥30 秒，这里用 60 秒更保险
 REQUEST_DELAY = 60
+
+# 全局计时器，用于绝对节流
+_last_request_time = 0.0
+
+def throttle():
+    """强制限速：如果距离上次请求不足 60 秒，就强制休眠等待"""
+    global _last_request_time
+    now = time.time()
+    elapsed = now - _last_request_time
+    if elapsed < REQUEST_DELAY:
+        wait_time = REQUEST_DELAY - elapsed
+        # 如果等待时间很短，就不打印了，免得刷屏
+        if wait_time > 1.0:
+            print(f"    [限速] 强制等待 {wait_time:.1f} 秒以保护 IP...")
+        time.sleep(wait_time)
+    _last_request_time = time.time()
 
 # START_PAGE 会被自动发现逻辑覆盖，这里是兜底值
 START_PAGE = "Intel Extreme Masters/2026/Cologne"
@@ -64,27 +85,27 @@ MAX_EVENTS = 30
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.path.join(SCRIPT_DIR, "major_data.json")
 
-TEAM_MAP = {
-    "fnc": "fnatic", "fnatic orig": "fnatic",
-    "nip": "Ninjas in Pyjamas",
-    "ninjas in pyjamas 2012": "Ninjas in Pyjamas",
-    "navi": "Natus Vincere",
-    "vit": "Vitality", "vitality": "Vitality",
-    "vp": "Virtus.pro", "virtus.pro 2012 2": "Virtus.pro",
-    "astralis orig": "Astralis", "astralis": "Astralis",
-    "faze": "FaZe", "faze clan nov 2021": "FaZe", "faze clan": "FaZe",
-    "envy": "EnVyUs", "nv": "EnVyUs", "team envyus orig": "EnVyUs",
-    "ldlc": "LDLC", "team ldlc.com 2012": "LDLC",
-    "lg": "Luminosity", "luminosity gaming orig": "Luminosity",
-    "sk": "SK Gaming", "c9": "Cloud9", "cloud9 orig": "Cloud9",
-    "gambit": "Gambit", "gambit esports1": "Gambit",
-    "imt": "Immortals", "outsiders": "Outsiders",
-    "heroic": "Heroic", "g2": "G2", "ence": "ENCE",
-    "avangar": "AVANGAR", "tl": "Team Liquid", "mibr": "MIBR",
-    "gamerlegion": "GamerLegion", "furia": "FURIA",
-    "mouz": "MOUZ", "spirit": "Spirit", "falcons": "Team Falcons",
-    "mongolz": "The MongolZ",
-}
+# === 读取队伍映射字典 ===
+TEAM_MAP_FILE = os.path.join(SCRIPT_DIR, "teams.json")
+try:
+    with open(TEAM_MAP_FILE, encoding="utf-8") as f:
+        TEAM_MAP = json.load(f)
+except FileNotFoundError:
+    print(f"✗ 未找到 {TEAM_MAP_FILE}，请确保它与爬虫在同一目录。")
+    sys.exit(1)
+except json.JSONDecodeError as e:
+    print(f"✗ 解析 {TEAM_MAP_FILE} 失败，请检查 JSON 格式是否正确。错误信息：{e}")
+    sys.exit(1)
+
+
+# ============ 自定义异常 ============
+class FetchError(Exception):
+    """网络请求或服务器错误（如超时、502）"""
+    pass
+
+class EmptyDataError(Exception):
+    """页面存在，但没有提取到数据（可能页面结构变了）"""
+    pass
 
 
 # ============ 工具 ============
@@ -132,7 +153,7 @@ def normalize_page_name(name):
     return name.replace("_", " ").strip()
 
 
-# ============ 数据存取 ============
+# ============ 数据迁移 ============
 def migrate_keys(data):
     """把 events 里的旧 key 统一 normalize（下划线 → 空格）"""
     events = data.get("events", {})
@@ -150,23 +171,22 @@ def migrate_keys(data):
 
     if changed:
         data["events"] = new_events
-        save(data)
-        print(f"  [迁移] events key 规范化：{len(events)} → {len(new_events)}")
-    return data
+    return data, changed
 
 
 def load():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, encoding="utf-8") as f:
             data = json.load(f)
-        data = migrate_keys(data)
         return data
     return {"events": {}}
 
-
 def save(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
+    # 核心：原子写入！先写临时文件，再替换。
+    tmp_file = DATA_FILE + ".tmp"
+    with open(tmp_file, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_file, DATA_FILE)
 
 
 # ============ Liquipedia 访问 ============
@@ -177,23 +197,36 @@ def t_new(page):
 
 
 def get_results(page):
+    throttle()  # 绝对限速
     try:
-        return t_new(page).get_results()
+        df = t_new(page).get_results()
+        if df is None or df.empty:
+            raise EmptyDataError(f"{page} 没有找到比赛数据")
+        return df
     except ValueError as e:
         if "concatenate" in str(e):
-            return None
+            raise EmptyDataError(f"{page} 解析失败 (concatenate)")
+        raise FetchError(f"解析 ValueError: {e}")
+    except EmptyDataError:
         raise
+    except RuntimeError as e:
+        # 核心新增：捕获底层库找不到页面时的崩溃
+        raise EmptyDataError(f"{page} 页面不存在或无法解析 (RuntimeError)")
     except Exception as e:
-        print(f"    ✗ get_results: {type(e).__name__}: {e}")
-        return None
+        raise FetchError(f"网络或 API 错误: {type(e).__name__}: {e}")
 
 
 def get_raw(page):
+    throttle()  # 绝对限速
     try:
-        return t_new(page).get_raw_str()
+        raw = t_new(page).get_raw_str()
+        if not raw:
+            raise EmptyDataError(f"{page} 获取不到原始 wikitext")
+        return raw
+    except EmptyDataError:
+        raise
     except Exception as e:
-        print(f"    ✗ get_raw_str: {type(e).__name__}: {e}")
-        return None
+        raise FetchError(f"获取 wikitext 失败: {type(e).__name__}: {e}")
 
 
 # ============ 解析：比赛 DataFrame ============
@@ -210,6 +243,12 @@ def num(row, col):
 def parse_df(df):
     if df is None or df.empty:
         return None
+        
+    # 列名体检，防止库升级导致 KeyError
+    required_cols = ["stage", "opponent_1", "opponent_2", "date", "map"]
+    if not all(col in df.columns for col in required_cols):
+        return None
+
     sl = df["stage"].astype(str).str.lower()
     finals = df[sl.str.contains("final", na=False)
                 & ~sl.str.contains("semi|quarter", na=False)
@@ -251,7 +290,11 @@ def parse_prizepool(raw):
         return None
     for m in re.finditer(
             r"\{\{prize pool slot\s*\|\s*place\s*=\s*1\b", raw):
-        seg = raw[m.start():m.start() + 1500]
+        
+        next_template = raw.find("{{", m.start() + 10)
+        end_pos = next_template if next_template != -1 else m.start() + 2000
+        seg = raw[m.start():end_pos]
+
         m2 = re.search(
             r"\|\s*([a-zA-Z0-9][a-zA-Z0-9 _\-]*?)\s*"
             r"\|\s*lastvs1\s*=\s*([a-zA-Z0-9][a-zA-Z0-9 _\-]*?)\s*"
@@ -291,19 +334,17 @@ def extract_mvp(raw, page):
     def norm(s):
         return s.split("|")[0].replace("_", " ").strip().lower()
     target = norm(page)
+    
     for line in raw.split("\n"):
         if not line.strip().startswith("|"):
             continue
-        parts = [p.strip() for p in line.split("||")]
-        if len(parts) < 5:
-            continue
-        m = re.search(r"\[\[([^\]|]+)", parts[0])
+        m = re.search(r"\[\[([^\]|]+)", line)
         if not m or norm(m.group(1)) != target:
             continue
-        pm = re.search(r"'''\[\[(?:[^\]|]*\|)?([^\]|]+)\]\]'''", parts[4])
+        pm = re.search(r"'''\[\[(?:[^\]|]*\|)?([^\]|]+)\]\]'''", line)
         if not pm:
-            pm = re.search(r"'''([^']+)'''", parts[4])
-        tm = re.search(r"\{\{TeamIcon\|([^}|]+)", parts[3])
+            pm = re.search(r"'''([^']+)'''", line)
+        tm = re.search(r"\{\{TeamIcon\|([^}|]+)", line)
         return {"player": pm.group(1).strip() if pm else "",
                 "team": tm.group(1).strip() if tm else ""}
     return None
@@ -320,7 +361,7 @@ def extract_majors_from_mvp(mvp_raw):
     for i, line in enumerate(lines):
         if "valvemajor-highlighted" not in line:
             continue
-        for j in range(i + 1, min(i + 4, len(lines))):
+        for j in range(i + 1, min(i + 5, len(lines))):
             data_line = lines[j]
             if not data_line.startswith("|") or "[[" not in data_line:
                 continue
@@ -332,8 +373,7 @@ def extract_majors_from_mvp(mvp_raw):
             page = normalize_page_name(raw_page)
 
             dm = re.search(r"\|\|\s*(\d{4}-\d{2}-\d{2})", data_line)
-            pmm = re.search(r"'''\[\[(?:[^\]|]*\|)?([^\]|]+)\]\]'''",
-                            data_line)
+            pmm = re.search(r"'''\[\[(?:[^\]|]*\|)?([^\]|]+)\]\]'''", data_line)
             if not pmm:
                 pmm = re.search(r"'''([^']+)'''", data_line)
             tm = re.search(r"\{\{TeamIcon\|([^}|]+)", data_line)
@@ -356,6 +396,12 @@ def extract_majors_from_mvp(mvp_raw):
         uniq.append(m)
 
     uniq.sort(key=lambda x: x["date"], reverse=True)
+    
+    if not uniq:
+        print("\n  ⚠ WARNING: 未从 MVP 页面提取到任何 Major 记录！")
+        print("  可能 'valvemajor-highlighted' 类名已被 Liquipedia 修改。")
+        print("  请检查 mvp_raw 的网页结构。\n")
+        
     return uniq
 
 
@@ -386,13 +432,15 @@ def refresh_mvp_raw_if_needed(data, missing_pages):
         return False
 
     print("    mvp_raw 可能已过期，重新抓取...")
-    mr = get_raw("HLTV/MVP_Awards")
-    if mr and len(mr) > 10000:
-        data["mvp_raw"] = mr
-        save(data)
-        print(f"    ✓ {len(mr)} 字符")
-        return True
-    print("    ✗ 抓取失败，保留旧数据")
+    try:
+        mr = get_raw("HLTV/MVP_Awards")
+        if mr and len(mr) > 10000:
+            data["mvp_raw"] = mr
+            save(data)
+            print(f"    ✓ {len(mr)} 字符")
+            return True
+    except Exception as e:
+        print(f"    ✗ 抓取失败: {e}")
     return False
 
 
@@ -454,13 +502,20 @@ def crawl(refresh=False, only_pages=None):
     visited = set()
 
     while page and page not in visited and len(visited) < MAX_EVENTS:
-        # 遍历前再 normalize 一次，防止 previous 里残留旧格式
         page = normalize_page_name(page)
         if page in visited:
             break
         visited.add(page)
 
-        if page in events and events[page].get("done") and not refresh:
+                # === 核心修复：识别“假完成”，如果之前失败了，无视 done 标记，重新抓取 ===
+        is_valid_cache = (
+            page in events 
+            and events[page].get("done") 
+            and events[page].get("path") not in ["failed", "network_failed"]
+            and not refresh
+        )
+        
+        if is_valid_cache:
             print(f"\n[{len(visited)}] {page}  [缓存]")
             prev = events[page].get("previous")
             page = normalize_page_name(prev) if prev else None
@@ -471,7 +526,6 @@ def crawl(refresh=False, only_pages=None):
         crawl_single(page, e, events)
         save(data)
 
-        # next page 也 normalize
         prev = e.get("previous")
         if prev:
             prev = normalize_page_name(prev)
@@ -479,15 +533,38 @@ def crawl(refresh=False, only_pages=None):
             print(f"\n  已到最早一届")
             break
         page = prev
-        time.sleep(REQUEST_DELAY)
 
 
 def crawl_single(page, e, events):
     print(f"    [1] get_results")
-    df = get_results(page)
-    time.sleep(REQUEST_DELAY)
+    
+    # 1. 抓取 DataFrame
+    try:
+        df = get_results(page)
+    except EmptyDataError as ex:
+        df = None
+        print(f"        - 提示: {ex} (准备尝试子页面兜底)")
+    except FetchError as ex:
+        print(f"    ✗ 严重网络故障: {ex}")
+        e["path"] = "network_failed"
+        e["done"] = False
+        events[page] = e
+        return
 
-    raw = get_raw(page)
+    # 2. 抓取原始文本
+    try:
+        raw = get_raw(page)
+    except EmptyDataError as ex:
+        raw = None
+        print(f"        - 提示: {ex}")
+    except FetchError as ex:
+        print(f"    ✗ 严重网络故障: {ex}")
+        e["path"] = "network_failed"
+        e["done"] = False
+        events[page] = e
+        return
+
+    # 3. 解析 raw 提取标题、上届赛事和取消状态
     if raw:
         m = re.search(r"\|\s*name\s*=\s*([^\n|]+)", raw)
         if m:
@@ -508,29 +585,41 @@ def crawl_single(page, e, events):
             print(f"    ⚠ 已取消")
             return
 
-    time.sleep(REQUEST_DELAY)
-
+    # 4. 第一层：尝试解析主页面
     final = parse_df(df) if df is not None else None
     if final:
         e["path"] = "main"
         e["final"] = final
 
+    # 5. 第二层：尝试解析子页面
     if not final and raw:
         stages = extract_stages(raw)
+        
+        # === 核心修复：如果正则没提取到，强制暴力尝试最常见的子页面名 ===
+        if not stages:
+            stages = ["Champions Stage", "Playoffs", "Playoff Stage", "Grand Final"]
+            
         if stages:
             print(f"    [2] Stage 子页面: {stages}")
             for st in stages:
                 sp = f"{page}/{st}"
                 print(f"        → {sp}")
-                time.sleep(REQUEST_DELAY)
-                f2 = parse_df(get_results(sp))
-                if f2:
-                    e["path"] = "subpage"
-                    e["subpage_used"] = sp
-                    e["final"] = f2
-                    final = f2
-                    break
+                try:
+                    f2 = parse_df(get_results(sp))
+                    if f2:
+                        e["path"] = "subpage"
+                        e["subpage_used"] = sp
+                        e["final"] = f2
+                        final = f2
+                        break
+                except FetchError as ex:
+                    print(f"        ✗ 子页面请求失败: {ex}")
+                    continue
+                except EmptyDataError:
+                    print(f"        - 页面为空或不存在，尝试下一个")
+                    continue
 
+    # 6. 第三层：尝试解析奖池兜底
     if not final and raw:
         print(f"    [3] prize pool")
         fd = parse_prizepool(raw)
@@ -539,25 +628,28 @@ def crawl_single(page, e, events):
             e["final"] = fd
             final = fd
 
+    # 7. 补充获取 previous 链接（如果前面没抓到）
     if not e.get("previous"):
-        time.sleep(REQUEST_DELAY)
         try:
+            throttle()
             info = t_new(page).get_info()
             e["previous"] = normalize_page_name(
                 clean_page_name(info.get("previous", "")) or "")
             if info.get("name"):
                 e["title"] = info["name"]
-        except Exception:
-            pass
+        except Exception as ex:
+            print(f"        ⚠ 获取 info 失败: {ex}")
 
+    # 8. 最终结果判定
     if final:
         print(f"    ✓ [{e['path']}] {final['t1']} "
               f"{final['score']} {final['t2']} → {final['winner']}")
+        e["done"] = True
     else:
-        print(f"    ✗ 未找到")
+        print(f"    ✗ 所有兜底均失败")
         e["path"] = "failed"
+        e["done"] = True
 
-    e["done"] = True
     events[page] = e
 
 
@@ -593,12 +685,21 @@ def fill_maps(data, refresh=False):
 
         print(f"    {p}")
         found = False
+        network_failed = False
 
         for sub in SUBPAGE_CANDIDATES:
             sp = f"{p}/{sub}"
             print(f"        尝试 {sub}")
-            time.sleep(REQUEST_DELAY)
-            df = get_results(sp)
+            
+            try:
+                df = get_results(sp)
+            except FetchError as ex:
+                print(f"        ✗ 网络错误: {ex}")
+                network_failed = True
+                break
+            except EmptyDataError:
+                continue
+                
             if df is None or df.empty:
                 continue
 
@@ -629,18 +730,14 @@ def fill_maps(data, refresh=False):
                 found = True
                 break
 
-        if not found:
+        if not found and not network_failed:
             print(f"        ✗ 所有候选子页面都没找到地图")
+        elif network_failed:
+            print(f"        ⚠ 因网络问题暂停补全地图，下次运行将重试")
 
 
 # ============ 报告 ============
 def normalize_map(m, winner_is_t1=True):
-    """
-    把 '地图 X-Y' 转成冠军视角。
-    m: "Cobblestone 11-16" —— 原数据里 X=t1得分, Y=t2得分
-    winner_is_t1: 冠军是否是原数据里的 t1
-    返回 "地图 X-Y"，X=冠军得分, Y=亚军得分
-    """
     mm = re.match(r"(\S.*?)\s+(\d+)-(\d+)$", m.strip())
     if not mm:
         return m
@@ -683,7 +780,6 @@ def build_records():
         mvp = e.get("mvp") or {}
         y = year_of(date) or year_of(e.get("title", ""))
 
-        # 地图转冠军视角：比较用原始值（避免 team_full 映射冲突）
         winner_is_t1 = (str(fd["winner"]).strip().lower()
                         == str(fd["t1"]).strip().lower())
 
@@ -803,20 +899,57 @@ def main():
 
     if not no_crawl and not check_only and not has_cache:
         print("=" * 70)
-        print("  ⚠ 未找到 major_data.json")
+        print("  ⚠ 未找到本地缓存 major_data.json")
         print("=" * 70)
-        print("\n将从最新赛事开始，抓取 2013-2026 全部 Major 决赛数据。")
+        print("\n【重要警告】Liquipedia API 风控极严！")
+        print("如果你使用的是校园网、公共 VPN 或代理，极大概率会被 429 封禁 IP。")
+        print("建议：1. 使用手机热点；2. 换干净的代理节点；3. 先借用别人的 major_data.json 缓存。")
+        print("\n如果准备就绪，程序将从最新赛事开始，抓取 2013-2026 全部 Major 数据。")
         print(f"预计耗时 60-90 分钟（每次 API 请求间隔 {REQUEST_DELAY} 秒）。")
-        print("\n中途可以 Ctrl+C 中断，下次运行会从断点继续。")
-        print()
+        print("中途可以 Ctrl+C 中断，下次运行会从断点继续。\n")
         try:
-            input("按回车开始抓取，或按 Ctrl+C 退出... ")
+            # 强制要求输入 OK，给人一个思考的时间
+            user_confirm = input("确认您的网络环境安全吗？输入 'OK' 开始抓取（或按 Ctrl+C 退出）: ")
+            if user_confirm.strip().upper() != "OK":
+                print("\n输入不正确，已取消。")
+                return
         except KeyboardInterrupt:
             print("\n已取消。")
             return
+            
+        # 【修复】：删除了重复的“按回车开始”提示
+        print("\n" + "=" * 70)
+        print("  🚀 开始抓取，请勿关闭终端...")
+        print("=" * 70)
 
+    # 1. 纯读取数据
     data = load()
+    
+    # 2. 检查并执行历史数据迁移
+    data, changed = migrate_keys(data)
+    if changed:
+        save(data)
+        print(f"  [迁移] events key 规范化完成并已保存。")
+        
     info = check_completeness(data)
+
+    # === 核心修复：如果 mvp_raw 为空，先抓取总览页面作为锚点 ===
+    if not info["all"] and not no_crawl:
+        print("\n  [启动] mvp_raw 为空，强制抓取 MVP 榜单以获取赛事列表...")
+        try:
+            mr = get_raw("HLTV/MVP_Awards")  # 底层 throttle 自动限速
+            data["mvp_raw"] = mr
+            save(data)
+            print(f"    ✓ 成功获取 {len(mr)} 字符的 MVP 数据")
+            info = check_completeness(data)
+            
+            # 获取完总览后，底层 throttle 已经做了 60 秒延迟，这里不需要额外 sleep
+        except Exception as e:
+            print(f"    ✗ 抓取 MVP 榜单失败: {e}")
+            print("    请检查网络或稍后再试（避免频繁请求导致封禁）。")
+            return
+    # ========================================================
+
     print_completeness(data, info)
 
     if check_only:
@@ -828,7 +961,6 @@ def main():
         missing_pages = [m["page"] for m in info["missing"]]
         if not no_crawl:
             refresh_mvp_raw_if_needed(data, missing_pages)
-            # 更新过 mvp_raw 后重新计算
             info = check_completeness(data)
         only_pages = [m["page"] for m in info["missing"]]
 
@@ -843,8 +975,6 @@ def main():
             print(f"\n从 {START_PAGE} 开始遍历")
             crawl(refresh=False)
 
-        # 关键：crawl 内部有自己的 data 并 save 过，
-        # 这里必须重新 load，避免用旧快照覆盖磁盘数据
         data = load()
         fill_maps(data)
 
